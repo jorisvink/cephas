@@ -133,7 +133,8 @@ usage(void)
 {
 	printf("Usage: cephas [opt] [ip:port] [send <file> | recv <file>]\n");
 	printf("Options:\n");
-	printf("    -c    Hexadecimal cs id\n");
+	printf("    -l    Hexadecimal local cs id\n");
+	printf("    -r    Hexadecimal remote cs id\n");
 	printf("    -f    Hexadecimal flock\n");
 	printf("    -t    Hexadecimal tunnel id\n");
 	printf("    -s    The COSK path\n");
