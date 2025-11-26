@@ -3,8 +3,11 @@
 Cephas is a way of distributing KEKs over unauthenticated links once
 both peers are joined in the same flock over reliquary.
 
-It uses the reliquary infrastructure to establish a p2p e2ee
-tunnel over which the secret is then sent.
+It is ment to be used with <a href="https://reliquary.se">The Reliquary</a>
+only.
+
+It uses that infrastructure to establish a p2p e2ee tunnel over
+which the secret is then sent.
 
 For this it derives a secret from a long passphrase (20 words,
 selected at random) which is used as the shared secret in the
