@@ -4,6 +4,10 @@ CC?=cc
 OBJDIR?=obj
 VERSION=$(OBJDIR)/version.c
 
+DESTDIR?=
+PREFIX?=/usr/local
+INSTALL_DIR=$(PREFIX)/bin
+
 BIN=cephas
 
 CFLAGS+=-std=c99 -Wall -Werror -Wstrict-prototypes
@@ -69,6 +73,10 @@ $(VERSION): $(OBJDIR) force
 	fi
 	@printf "const char *tier6_build_date = \"%s\";\n" \
 	    `date +"%Y-%m-%d"` >> $(VERSION);
+
+install: $(BIN)
+	mkdir -p $(DESTDIR)$(INSTALL_DIR)
+	install -m 555 $(BIN) $(DESTDIR)$(INSTALL_DIR)/
 
 clean:
 	rm -f $(VERSION)
