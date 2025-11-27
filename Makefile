@@ -14,7 +14,7 @@ CFLAGS+=-std=c99 -Wall -Werror -Wstrict-prototypes
 CFLAGS+=-Wmissing-prototypes -Wmissing-declarations -Wshadow
 CFLAGS+=-Wpointer-arith -Wcast-qual -Wsign-compare -O2 -fPIC
 CFLAGS+=-fstack-protector-all -Wtype-limits -fno-common -g
-CFLAGS+=-Iinclude -I../nyfe/include
+CFLAGS+=-Iinclude
 
 CFLAGS+=$(shell pkg-config --cflags libkyrka)
 LDFLAGS+=$(shell pkg-config --libs libkyrka)

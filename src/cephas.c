@@ -35,7 +35,7 @@
 #include <termios.h>
 #include <unistd.h>
 
-#include <libnyfe.h>
+#include <libkyrka/libnyfe.h>
 #include <libkyrka/libkyrka.h>
 
 #include "wordlist.h"
