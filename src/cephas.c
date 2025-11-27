@@ -191,10 +191,10 @@ main(int argc, char **argv)
 	argc -= optind;
 	argv += optind;
 
-	cephas_validate_opt();
-
 	if (argc != 3)
 		usage();
+
+	cephas_validate_opt();
 
 	cephas_signal_trap(SIGINT);
 	cephas_signal_trap(SIGHUP);
