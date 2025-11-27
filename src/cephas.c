@@ -137,7 +137,8 @@ usage(void)
 	printf("    -r    Hexadecimal remote cs id\n");
 	printf("    -f    Hexadecimal flock\n");
 	printf("    -t    Hexadecimal tunnel id\n");
-	printf("    -s    The COSK path\n");
+	printf("    -o    The COSK path\n");
+	printf("    -s    The cathedral secret path\n");
 	exit(1);
 }
 
