@@ -25,6 +25,7 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <fcntl.h>
+#include <netdb.h>
 #include <paths.h>
 #include <poll.h>
 #include <signal.h>
@@ -101,9 +102,9 @@ static void	cephas_parse_mode(const char *, const char *);
 static void	cephas_digest(const char *, const void *, size_t);
 
 static void	cephas_tunnel_event(KYRKA *, union kyrka_event *, void *);
-static void	cephas_heaven_ifc(const void *, size_t, u_int64_t, void *);
-static void	cephas_purgatory_ifc(const void *, size_t, u_int64_t, void *);
-static void	cephas_cathedral_ifc(const void *, size_t, u_int64_t, void *);
+static void	cephas_heaven_ifc(struct kyrka_packet *, u_int64_t, void *);
+static void	cephas_purgatory_ifc(struct kyrka_packet *, u_int64_t, void *);
+static void	cephas_cathedral_ifc(struct kyrka_packet *, u_int64_t, void *);
 
 static const char	*cephas_word_select(void);
 static int		cephas_word_exists(const char *);
@@ -117,8 +118,8 @@ static struct {
 	u_int32_t			remote;
 
 	int				mode;
-	int				running;
 	int				online;
+	int				running;
 
 	const char			*path;
 	u_int8_t			kek[32];
@@ -157,6 +158,7 @@ main(int argc, char **argv)
 	state.online = 0;
 
 	memset(&state.cfg, 0, sizeof(state.cfg));
+
 	state.cfg.send = cephas_cathedral_ifc;
 
 	while ((ch = getopt(argc, argv, "f:l:t:r:s:o:")) != -1) {
@@ -294,6 +296,12 @@ cephas_configure_tunnel(void)
 	if ((state.ctx = kyrka_ctx_alloc(cephas_tunnel_event, NULL)) == NULL)
 		fatal("failed to create libkyrka context");
 
+	if (kyrka_shroud_enable(state.ctx) == -1)
+		fatal("failed to enable shroud");
+
+	if (kyrka_mtu_size(state.ctx, 800) == -1)
+		fatal("failed to set mtu");
+
 	if (kyrka_heaven_ifc(state.ctx, cephas_heaven_ifc, NULL) == -1)
 		fatal("kyrka_heaven_ifc: %d", kyrka_last_error(state.ctx));
 
@@ -338,8 +346,7 @@ cephas_run(void)
 	last = 0;
 	state.running = 1;
 
-	printf("Waiting for peer ... ");
-	fflush(stdout);
+	printf("Waiting for peer ...\n");
 
 	while (state.running) {
 		if ((nfd = poll(&pfd, 1, 1000)) == -1)
@@ -390,11 +397,16 @@ cephas_run(void)
 static void
 cephas_socket_read(void)
 {
-	ssize_t		ret;
-	u_int8_t	pkt[1500];
+	ssize_t			ret;
+	size_t			len;
+	struct kyrka_packet	pkt;
+	void			*ptr;
 
 	for (;;) {
-		ret = recv(state.fd, pkt, sizeof(pkt), MSG_DONTWAIT);
+		if ((ptr = kyrka_packet_recvbuf(state.ctx, &pkt, &len)) == NULL)
+			fatal("failed to get recvbuf");
+
+		ret = recv(state.fd, ptr, len, MSG_DONTWAIT);
 		if (ret == -1) {
 			if (errno == EWOULDBLOCK || errno == EAGAIN)
 				return;
@@ -404,7 +416,10 @@ cephas_socket_read(void)
 		if (ret == 0)
 			continue;
 
-		if (kyrka_purgatory_input(state.ctx, pkt, ret) == -1) {
+		pkt.length = ret;
+		pkt.shroud = KYRKA_PACKET_SHROUD_CATHEDRAL;
+
+		if (kyrka_purgatory_input(state.ctx, &pkt) == -1) {
 			if (kyrka_last_error(state.ctx) !=
 			    KYRKA_ERROR_CATHEDRAL_CONFIG) {
 				printf("kyrka_purgatory_input: %d\n",
@@ -420,17 +435,28 @@ cephas_socket_read(void)
 static void
 cephas_send_kek(void)
 {
-	struct cephas_msg	pkt;
+	size_t			len;
+	struct kyrka_packet	pkt;
+	struct cephas_msg	*msg;
 
 	PRECOND(state.mode == CEPHAS_MODE_SENDING);
 
+	if ((msg = kyrka_packet_databuf(state.ctx, &pkt, &len)) == NULL)
+		fatal("failed to get databuf for KEK");
+
+	if (len < sizeof(*msg))
+		fatal("not enough space for KEK");
+
 	nyfe_zeroize_register(&pkt, sizeof(pkt));
-	nyfe_mem_zero(&pkt, sizeof(pkt));
+	nyfe_mem_zero(msg, sizeof(*msg));
 
-	pkt.type = CEPHAS_MSG_KEK_DATA;
-	nyfe_memcpy(pkt.kek, state.kek, sizeof(state.kek));
+	msg->type = CEPHAS_MSG_KEK_DATA;
+	nyfe_memcpy(msg->kek, state.kek, sizeof(state.kek));
 
-	if (kyrka_heaven_input(state.ctx, &pkt, sizeof(pkt)) == -1)
+	pkt.length = sizeof(*msg);
+	pkt.shroud = KYRKA_PACKET_SHROUD_CATHEDRAL;
+
+	if (kyrka_heaven_input(state.ctx, &pkt) == -1)
 		fatal("kyrka_heaven_input: %d", kyrka_last_error(state.ctx));
 
 	nyfe_zeroize(&pkt, sizeof(pkt));
@@ -443,16 +469,26 @@ static void
 cephas_send_ack(void)
 {
 	int			i;
-	struct cephas_msg	ack;
+	struct kyrka_packet	pkt;
+	size_t			len;
+	struct cephas_msg	*msg;
 
 	PRECOND(state.mode == CEPHAS_MODE_RECEIVING);
 
-	nyfe_mem_zero(&ack, sizeof(ack));
+	if ((msg = kyrka_packet_databuf(state.ctx, &pkt, &len)) == NULL)
+		fatal("failed to get databuf for ack");
 
-	ack.type = CEPHAS_MSG_ACK;
+	if (len < sizeof(*msg))
+		fatal("not enough space for ACK");
+
+	nyfe_mem_zero(msg, sizeof(*msg));
+	msg->type = CEPHAS_MSG_ACK;
+
+	pkt.length = sizeof(*msg);
+	pkt.shroud = KYRKA_PACKET_SHROUD_CATHEDRAL;
 
 	for (i = 0; i < 10; i++) {
-		if (kyrka_heaven_input(state.ctx, &ack, sizeof(ack)) == -1) {
+		if (kyrka_heaven_input(state.ctx, &pkt) == -1) {
 			fatal("kyrka_heaven_input: %d",
 			    kyrka_last_error(state.ctx));
 		}
@@ -467,13 +503,23 @@ cephas_send_ack(void)
 static void
 cephas_send_heartbeat(void)
 {
-	struct cephas_msg	hb;
+	size_t			len;
+	struct kyrka_packet	pkt;
+	struct cephas_msg	*msg;
 
-	nyfe_mem_zero(&hb, sizeof(hb));
+	if ((msg = kyrka_packet_databuf(state.ctx, &pkt, &len)) == NULL)
+		fatal("failed to get hb databuf");
 
-	hb.type = CEPHAS_MSG_HEARTBEAT;
+	if (len < sizeof(*msg))
+		fatal("not enough space for heartbeat");
 
-	if (kyrka_heaven_input(state.ctx, &hb, sizeof(hb)) == -1)
+	nyfe_mem_zero(msg, sizeof(*msg));
+	msg->type = CEPHAS_MSG_HEARTBEAT;
+
+	pkt.length = sizeof(*msg);
+	pkt.shroud = KYRKA_PACKET_SHROUD_CATHEDRAL;
+
+	if (kyrka_heaven_input(state.ctx, &pkt) == -1)
 		fatal("kyrka_heaven_input: %d", kyrka_last_error(state.ctx));
 }
 
@@ -516,22 +562,21 @@ cephas_tunnel_event(KYRKA *ctx, union kyrka_event *evt, void *udata)
  * Callback from libkyrka when there is plaintext data to be handled.
  */
 static void
-cephas_heaven_ifc(const void *data, size_t len, u_int64_t magic, void *udata)
+cephas_heaven_ifc(struct kyrka_packet *pkt, u_int64_t magic, void *udata)
 {
 	int				fd;
 	const struct cephas_msg		*msg;
 
-	PRECOND(data != NULL);
-	PRECOND(len > 0);
+	PRECOND(pkt != NULL);
 	PRECOND(udata == NULL);
 
-	if (len != sizeof(*msg))
-		fatal("peer sent wrong sized msg (len: %zu)", len);
+	if (pkt->length != sizeof(*msg))
+		fatal("peer sent wrong sized msg (len: %zu)", pkt->length);
 
 	if (state.online == 0)
 		return;
 
-	msg = data;
+	msg = kyrka_packet_data(pkt);
 
 	switch (msg->type) {
 	case CEPHAS_MSG_HEARTBEAT:
@@ -567,11 +612,16 @@ cephas_heaven_ifc(const void *data, size_t len, u_int64_t magic, void *udata)
  * We simply send it to our current known peer address.
  */
 static void
-cephas_purgatory_ifc(const void *data, size_t len, u_int64_t magic, void *udata)
+cephas_purgatory_ifc(struct kyrka_packet *pkt, u_int64_t magic, void *udata)
 {
-	PRECOND(data != NULL);
-	PRECOND(len > 0);
+	size_t		len;
+	void		*data;
+
+	PRECOND(pkt != NULL);
 	PRECOND(udata == NULL);
+
+	if ((data = kyrka_packet_sendbuf(state.ctx, pkt, &len)) == NULL)
+		fatal("no sendbuf when sending to purgatory");
 
 	if (sendto(state.fd, data, len, 0,
 	    (const struct sockaddr *)&state.peer, sizeof(state.peer)) == -1)
@@ -582,11 +632,16 @@ cephas_purgatory_ifc(const void *data, size_t len, u_int64_t magic, void *udata)
  * Callback from libkyrka when there is ciphertext to be sent to our cathedral.
  */
 static void
-cephas_cathedral_ifc(const void *data, size_t len, u_int64_t magic, void *udata)
+cephas_cathedral_ifc(struct kyrka_packet *pkt, u_int64_t magic, void *udata)
 {
-	PRECOND(data != NULL);
-	PRECOND(len > 0);
+	size_t		len;
+	void		*data;
+
+	PRECOND(pkt != NULL);
 	PRECOND(udata == NULL);
+
+	if ((data = kyrka_packet_sendbuf(state.ctx, pkt, &len)) == NULL)
+		fatal("no sendbuf when sending to cathedral");
 
 	if (sendto(state.fd, data, len, 0,
 	    (const struct sockaddr *)&state.cathedral,
@@ -960,26 +1015,36 @@ cephas_word_exists(const char *word)
  * We also use it as the initial peer address.
  */
 static void
-cephas_parse_cathedral(char *ip)
+cephas_parse_cathedral(char *host)
 {
-	char		*port;
+	int			ret;
+	char			*port;
+	struct addrinfo		hints, *res, *rp;
 
-	PRECOND(ip != NULL);
+	PRECOND(host != NULL);
 
-	if ((port = strchr(ip, ':')) == NULL)
+	if ((port = strchr(host, ':')) == NULL)
 		fatal("missing port, address format must be ip:port");
 
 	*(port)++ = '\0';
 
-	if (sscanf(port, "%hu", &state.cathedral.sin_port) != 1)
-		fatal("port '%s' is invalid", port);
+	memset(&hints, 0, sizeof(hints));
 
-	state.cathedral.sin_family = AF_INET;
-	state.cathedral.sin_port = htobe16(state.cathedral.sin_port);
+	hints.ai_family = AF_INET;
+	hints.ai_socktype = SOCK_DGRAM;
 
-	if (inet_pton(AF_INET, ip, &state.cathedral.sin_addr) == -1)
-		fatal("ipv4 address '%s' is invalid (%s)", ip, errno_s);
+	if ((ret = getaddrinfo(host, port, &hints, &res)) != 0)
+		fatal("cathedral '%s': %s", host, gai_strerror(ret));
 
+	for (rp = res; rp != NULL; rp = rp->ai_next) {
+		if (rp->ai_family == AF_INET && rp->ai_socktype == SOCK_DGRAM)
+			break;
+	}
+
+	if (rp == NULL)
+		fatal("cathedral '%s' failed to resolve", host);
+
+	memcpy(&state.cathedral, rp->ai_addr, sizeof(state.cathedral));
 	memcpy(&state.peer, &state.cathedral, sizeof(state.cathedral));
 }
 
