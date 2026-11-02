@@ -450,14 +450,18 @@ cephas_socket_read(void)
 	struct kyrka_packet	pkt;
 	void			*ptr;
 
+	nyfe_zeroize_register(&pkt, sizeof(pkt));
+
 	for (;;) {
 		if ((ptr = kyrka_packet_recvbuf(state.ctx, &pkt, &len)) == NULL)
 			fatal("failed to get recvbuf");
 
 		ret = recv(state.fd, ptr, len, MSG_DONTWAIT);
 		if (ret == -1) {
-			if (errno == EWOULDBLOCK || errno == EAGAIN)
+			if (errno == EWOULDBLOCK || errno == EAGAIN) {
+				nyfe_zeroize(&pkt, sizeof(pkt));
 				return;
+			}
 			fatal("recv: %s", errno_s);
 		}
 
@@ -475,6 +479,8 @@ cephas_socket_read(void)
 			}
 		}
 	}
+
+	nyfe_zeroize(&pkt, sizeof(pkt));
 }
 
 /*
@@ -950,6 +956,8 @@ cephas_words_read(char *pass, size_t len, int count)
 	PRECOND(len > 0);
 	PRECOND(count > 0);
 
+	nyfe_zeroize_register(word, sizeof(word));
+
 	if ((fd = open(_PATH_TTY, O_RDWR)) == -1)
 		fatal("open(%s): %s", _PATH_TTY, errno_s);
 
@@ -1026,6 +1034,7 @@ cephas_words_read(char *pass, size_t len, int count)
 	}
 
 	pass[poff] = '\0';
+	nyfe_zeroize(word, sizeof(word));
 
 	if (tcsetattr(fd, TCSANOW, &old) == -1)
 		fatal("tcsetattr: %s", errno_s);
