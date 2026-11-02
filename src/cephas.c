@@ -47,6 +47,18 @@
 /* The KDF label used for deriving key material from a passphrase. */
 #define CEPHAS_PASS_LABEL	"CEPHAS.PBKDF.PASSPHRASE"
 
+/* The label used for the checksum over the route words. */
+#define CEPHAS_ROUTE_LABEL	"CEPHAS.ROUTE.CHECKSUM"
+
+/* The number of words in a passphrase. */
+#define CEPHAS_PASS_WORDS	20
+
+/* The number of words that route us to our peer, see cephas_route(). */
+#define CEPHAS_ROUTE_WORDS	13
+
+/* The length of a route once decoded from its words. */
+#define CEPHAS_ROUTE_LEN	21
+
 /* The mode we are currently running under. */
 #define CEPHAS_MODE_SENDING	1
 #define CEPHAS_MODE_RECEIVING	2
@@ -67,7 +79,8 @@
  * A protocol message used to transfer data between the two peers.
  *
  * This is either a heartbeat message to help with NAT traversal and
- * keep-alive or the actual contents of the KEK we are trying to transfer.
+ * keep-alive, the actual contents of the KEK we are trying to transfer
+ * or the ack for it which carries the SHA3-256 digest of the KEK.
  */
 #define CEPHAS_MSG_HEARTBEAT		1
 #define CEPHAS_MSG_KEK_DATA		2
@@ -75,7 +88,7 @@
 
 struct cephas_msg {
 	u_int8_t	type;
-	u_int8_t	kek[32];
+	u_int8_t	data[32];
 } __attribute__((packed));
 
 static void	usage(void) __attribute__((noreturn));
@@ -86,11 +99,12 @@ static void	cephas_signal_trap(int);
 static void	cephas_signal_hdlr(int);
 static void	cephas_signal_memfault(int);
 
+static void	cephas_words_read(char *, size_t, int);
+static void	cephas_route_from_words(char *, size_t);
 static void	cephas_secret_derive(u_int8_t *, size_t);
 static void	cephas_passphrase_from_words(char *, size_t);
 
 static void	cephas_run(void);
-static void	cephas_send_ack(void);
 static void	cephas_send_kek(void);
 static void	cephas_socket_read(void);
 static void	cephas_validate_opt(void);
@@ -99,7 +113,10 @@ static void	cephas_configure_tunnel(void);
 static void	cephas_parse_cathedral(char *);
 static void	cephas_passphrase_populate(char *, size_t);
 static void	cephas_parse_mode(const char *, const char *);
+static void	cephas_route(const u_int16_t *, size_t, const char *);
 static void	cephas_digest(const char *, const void *, size_t);
+static void	cephas_send_ack(const u_int8_t *, size_t);
+static void	cephas_sha3(const void *, size_t, u_int8_t *, size_t);
 
 static void	cephas_tunnel_event(KYRKA *, union kyrka_event *, void *);
 static void	cephas_heaven_ifc(struct kyrka_packet *, u_int64_t, void *);
@@ -107,7 +124,7 @@ static void	cephas_purgatory_ifc(struct kyrka_packet *, u_int64_t, void *);
 static void	cephas_cathedral_ifc(struct kyrka_packet *, u_int64_t, void *);
 
 static const char	*cephas_word_select(void);
-static int		cephas_word_exists(const char *);
+static int		cephas_word_index(const char *);
 static size_t		cephas_word_autocomplete(char *, size_t, size_t);
 
 /* Local state. */
@@ -120,8 +137,10 @@ static struct {
 	int				mode;
 	int				online;
 	int				running;
+	int				covenant;
 
 	const char			*path;
+	char				kekpath[PATH_MAX];
 	u_int8_t			kek[32];
 
 	struct sockaddr_in		peer;
@@ -133,7 +152,14 @@ static void
 usage(void)
 {
 	printf("Usage: cephas [opt] [ip:port] [send <file> | recv <file>]\n");
+	printf("       cephas -c recv <dir>\n");
+	printf("\n");
+	printf("The second form asks for the words from covenant, these\n");
+	printf("tell us the cathedral, flock, tunnel and remote cs id.\n");
+	printf("The KEK is written as kek-0xNN into <dir>.\n");
+	printf("\n");
 	printf("Options:\n");
+	printf("    -c    Our remote is covenant\n");
 	printf("    -l    Hexadecimal local cs id\n");
 	printf("    -r    Hexadecimal remote cs id\n");
 	printf("    -f    Hexadecimal flock\n");
@@ -156,13 +182,17 @@ main(int argc, char **argv)
 
 	state.remote = 0;
 	state.online = 0;
+	state.covenant = 0;
 
 	memset(&state.cfg, 0, sizeof(state.cfg));
 
 	state.cfg.send = cephas_cathedral_ifc;
 
-	while ((ch = getopt(argc, argv, "f:l:t:r:s:o:")) != -1) {
+	while ((ch = getopt(argc, argv, "cf:l:t:r:s:o:")) != -1) {
 		switch (ch) {
+		case 'c':
+			state.covenant = 1;
+			break;
 		case 'f':
 			if (sscanf(optarg, "%" PRIx64,
 			    &state.cfg.flock_src) != 1)
@@ -194,8 +224,13 @@ main(int argc, char **argv)
 	argc -= optind;
 	argv += optind;
 
-	if (argc != 3)
-		usage();
+	if (state.covenant) {
+		if (argc != 2)
+			usage();
+	} else {
+		if (argc != 3)
+			usage();
+	}
 
 	cephas_validate_opt();
 
@@ -204,8 +239,14 @@ main(int argc, char **argv)
 	cephas_signal_trap(SIGQUIT);
 	cephas_signal_trap(SIGTERM);
 
-	cephas_parse_cathedral(argv[0]);
-	cephas_parse_mode(argv[1], argv[2]);
+	if (state.covenant) {
+		cephas_parse_mode(argv[0], argv[1]);
+		if (state.mode != CEPHAS_MODE_RECEIVING)
+			fatal("the words from covenant are only for recv");
+	} else {
+		cephas_parse_cathedral(argv[0]);
+		cephas_parse_mode(argv[1], argv[2]);
+	}
 
 	cephas_configure_tunnel();
 	cephas_run();
@@ -269,17 +310,24 @@ cephas_validate_opt(void)
 	if (state.cfg.identity == 0)
 		fatal("no local identity (-l) set");
 
-	if (state.cfg.flock_src == 0)
-		fatal("no flock (-f) set");
-
-	if (state.cfg.tunnel == 0)
-		fatal("no tunnel (-t) set");
-
 	if (state.cfg.secret == NULL)
 		fatal("no cathedral secret (-s) set");
 
 	if (state.cfg.cosk == NULL)
 		fatal("no cosk private key (-o) set");
+
+	if (state.covenant) {
+		if (state.cfg.flock_src != 0 || state.cfg.tunnel != 0 ||
+		    state.remote != 0)
+			fatal("-f, -t and -r come from the words");
+		return;
+	}
+
+	if (state.cfg.flock_src == 0)
+		fatal("no flock (-f) set");
+
+	if (state.cfg.tunnel == 0)
+		fatal("no tunnel (-t) set");
 
 	if (state.remote == 0)
 		fatal("no remote identity (-r) set");
@@ -451,7 +499,7 @@ cephas_send_kek(void)
 	nyfe_mem_zero(msg, sizeof(*msg));
 
 	msg->type = CEPHAS_MSG_KEK_DATA;
-	nyfe_memcpy(msg->kek, state.kek, sizeof(state.kek));
+	nyfe_memcpy(msg->data, state.kek, sizeof(state.kek));
 
 	pkt.length = sizeof(*msg);
 	pkt.shroud = KYRKA_PACKET_SHROUD_CATHEDRAL;
@@ -463,31 +511,35 @@ cephas_send_kek(void)
 }
 
 /*
- * Send a burst of ACKs to our peer, we've gotten the KEK.
+ * Send a burst of ACKs to our peer, we've gotten the KEK and tell
+ * our peer its digest so it knows it arrived intact.
  */
 static void
-cephas_send_ack(void)
+cephas_send_ack(const u_int8_t *digest, size_t digest_len)
 {
 	int			i;
 	struct kyrka_packet	pkt;
 	size_t			len;
 	struct cephas_msg	*msg;
 
+	PRECOND(digest != NULL);
+	PRECOND(digest_len == sizeof(msg->data));
 	PRECOND(state.mode == CEPHAS_MODE_RECEIVING);
 
-	if ((msg = kyrka_packet_databuf(state.ctx, &pkt, &len)) == NULL)
-		fatal("failed to get databuf for ack");
-
-	if (len < sizeof(*msg))
-		fatal("not enough space for ACK");
-
-	nyfe_mem_zero(msg, sizeof(*msg));
-	msg->type = CEPHAS_MSG_ACK;
-
-	pkt.length = sizeof(*msg);
-	pkt.shroud = KYRKA_PACKET_SHROUD_CATHEDRAL;
-
 	for (i = 0; i < 10; i++) {
+		if ((msg = kyrka_packet_databuf(state.ctx, &pkt, &len)) == NULL)
+			fatal("failed to get databuf for ack");
+
+		if (len < sizeof(*msg))
+			fatal("not enough space for ACK");
+
+		nyfe_mem_zero(msg, sizeof(*msg));
+		msg->type = CEPHAS_MSG_ACK;
+		memcpy(msg->data, digest, digest_len);
+
+		pkt.length = sizeof(*msg);
+		pkt.shroud = KYRKA_PACKET_SHROUD_CATHEDRAL;
+
 		if (kyrka_heaven_input(state.ctx, &pkt) == -1) {
 			fatal("kyrka_heaven_input: %d",
 			    kyrka_last_error(state.ctx));
@@ -566,6 +618,7 @@ cephas_heaven_ifc(struct kyrka_packet *pkt, u_int64_t magic, void *udata)
 {
 	int				fd;
 	const struct cephas_msg		*msg;
+	u_int8_t			digest[32];
 
 	PRECOND(pkt != NULL);
 	PRECOND(udata == NULL);
@@ -585,20 +638,30 @@ cephas_heaven_ifc(struct kyrka_packet *pkt, u_int64_t magic, void *udata)
 		if (state.mode != CEPHAS_MODE_RECEIVING)
 			fatal("peer sent unexpected CEPHAS_MSG_KEK_DATA");
 
+		if (state.running == 0)
+			break;
+
 		fd = nyfe_file_open(state.path, NYFE_FILE_CREATE);
-		nyfe_file_write(fd, msg->kek, sizeof(msg->kek));
+		nyfe_file_write(fd, msg->data, sizeof(msg->data));
 		if (close(fd) == -1) {
 			printf("close: %s\n", errno_s);
 			(void)unlink(state.path);
 		} else {
-			cephas_digest("kek-digest", msg->kek, sizeof(msg->kek));
-			cephas_send_ack();
+			cephas_sha3(msg->data, sizeof(msg->data),
+			    digest, sizeof(digest));
+			cephas_digest("kek-digest",
+			    msg->data, sizeof(msg->data));
+			cephas_send_ack(digest, sizeof(digest));
 			state.running = 0;
 		}
 		break;
 	case CEPHAS_MSG_ACK:
 		if (state.mode != CEPHAS_MODE_SENDING)
 			fatal("peer sent unexpected CEPHAS_MSG_ACK");
+		cephas_sha3(state.kek, sizeof(state.kek),
+		    digest, sizeof(digest));
+		if (nyfe_mem_cmp(msg->data, digest, sizeof(digest)) != 0)
+			fatal("peer acked a KEK that is not ours");
 		state.running = 0;
 		break;
 	default:
@@ -656,21 +719,40 @@ static void
 cephas_digest(const char *name, const void *data, size_t len)
 {
 	size_t			idx;
-	struct nyfe_sha3	ctx;
 	u_int8_t		digest[32];
 
 	PRECOND(name != NULL);
 	PRECOND(data != NULL);
 	PRECOND(len > 0);
 
-	nyfe_sha3_init256(&ctx);
-	nyfe_sha3_update(&ctx, data, len);
-	nyfe_sha3_final(&ctx, digest, sizeof(digest));
+	cephas_sha3(data, len, digest, sizeof(digest));
 
 	printf("%s = ", name);
 	for (idx = 0; idx < sizeof(digest); idx++)
 		printf("%02x", digest[idx]);
 	printf("\n");
+}
+
+/*
+ * Calculate the SHA3-256 digest for some data.
+ */
+static void
+cephas_sha3(const void *data, size_t len, u_int8_t *digest, size_t dlen)
+{
+	struct nyfe_sha3	ctx;
+
+	PRECOND(data != NULL);
+	PRECOND(len > 0);
+	PRECOND(digest != NULL);
+	PRECOND(dlen == 32);
+
+	nyfe_zeroize_register(&ctx, sizeof(ctx));
+
+	nyfe_sha3_init256(&ctx);
+	nyfe_sha3_update(&ctx, data, len);
+	nyfe_sha3_final(&ctx, digest, dlen);
+
+	nyfe_zeroize(&ctx, sizeof(ctx));
 }
 
 /*
@@ -713,6 +795,8 @@ cephas_secret_derive(u_int8_t *secret, size_t len)
 
 	if (state.mode == CEPHAS_MODE_SENDING)
 		cephas_passphrase_populate(pass, sizeof(pass));
+	else if (state.covenant)
+		cephas_route_from_words(pass, sizeof(pass));
 	else
 		cephas_passphrase_from_words(pass, sizeof(pass));
 
@@ -786,6 +870,77 @@ cephas_secret_derive(u_int8_t *secret, size_t len)
 static void
 cephas_passphrase_from_words(char *pass, size_t len)
 {
+	PRECOND(pass != NULL);
+	PRECOND(len > 0);
+
+	printf("Please enter the words as obtained from your peer\n");
+	printf("in a one-by-one fashion. You can press TAB to auto-complete\n");
+	printf("words or CTRL-C to exit the transfer.\n");
+
+	cephas_words_read(pass, len, CEPHAS_PASS_WORDS);
+}
+
+/*
+ * Read the words covenant gave the user, the first CEPHAS_ROUTE_WORDS
+ * words are the route and the others are the passphrase, which is
+ * constructed into pass.
+ */
+static void
+cephas_route_from_words(char *pass, size_t len)
+{
+	char		*word;
+	char		words[1024];
+	size_t		off, poff, wlen;
+	int		idx, slen, which;
+	u_int16_t	route[CEPHAS_ROUTE_WORDS];
+
+	PRECOND(pass != NULL);
+	PRECOND(len > 0);
+
+	nyfe_zeroize_register(words, sizeof(words));
+
+	printf("Please enter the words as obtained from covenant\n");
+	printf("in a one-by-one fashion. You can press TAB to auto-complete\n");
+	printf("words or CTRL-C to exit the transfer.\n");
+
+	cephas_words_read(words, sizeof(words),
+	    CEPHAS_ROUTE_WORDS + CEPHAS_PASS_WORDS);
+
+	off = 0;
+	poff = 0;
+
+	for (idx = 0; idx < CEPHAS_ROUTE_WORDS + CEPHAS_PASS_WORDS; idx++) {
+		word = &words[off];
+		wlen = strcspn(word, " ");
+		word[wlen] = '\0';
+		off += wlen + 1;
+
+		if (idx < CEPHAS_ROUTE_WORDS) {
+			if ((which = cephas_word_index(word)) == -1)
+				fatal("word '%s' not found", word);
+			route[idx] = which;
+			continue;
+		}
+
+		slen = snprintf(pass + poff, len - poff, "%s ", word);
+		if (slen == -1 || (size_t)slen >= (len - poff))
+			fatal("failed to construct passphrase");
+
+		poff += slen;
+	}
+
+	nyfe_zeroize(words, sizeof(words));
+
+	cephas_route(route, CEPHAS_ROUTE_WORDS, pass);
+}
+
+/*
+ * Read count words from the user its terminal into pass, each word
+ * followed by a space.
+ */
+static void
+cephas_words_read(char *pass, size_t len, int count)
+{
 	char			word[32];
 	struct termios		cur, old;
 	size_t			off, poff;
@@ -793,10 +948,7 @@ cephas_passphrase_from_words(char *pass, size_t len)
 
 	PRECOND(pass != NULL);
 	PRECOND(len > 0);
-
-	printf("Please enter the words as obtained from your peer\n");
-	printf("in a one-by-one fashion. You can press TAB to auto-complete\n");
-	printf("words or CTRL-C to exit the transfer.\n");
+	PRECOND(count > 0);
 
 	if ((fd = open(_PATH_TTY, O_RDWR)) == -1)
 		fatal("open(%s): %s", _PATH_TTY, errno_s);
@@ -819,7 +971,7 @@ cephas_passphrase_from_words(char *pass, size_t len)
 	poff = 0;
 	memset(pass, 0, len);
 
-	for (i = 0; i < 20; i++) {
+	for (i = 0; i < count; i++) {
 		off = 0;
 		memset(word, 0, sizeof(word));
 
@@ -835,7 +987,7 @@ cephas_passphrase_from_words(char *pass, size_t len)
 
 			if (word[off] == '\n') {
 				word[off] = '\0';
-				if (cephas_word_exists(word) == -1) {
+				if (cephas_word_index(word) == -1) {
 					printf("\n\r%s not found\n", word);
 					continue;
 				}
@@ -860,7 +1012,8 @@ cephas_passphrase_from_words(char *pass, size_t len)
 				}
 				break;
 			default:
-				off++;
+				if (off < sizeof(word) - 1)
+					off++;
 				break;
 			}
 		}
@@ -991,21 +1144,130 @@ cephas_word_autocomplete(char *word, size_t off, size_t max)
 }
 
 /*
- * Check if the given word exists in the word list.
+ * Look up the given word in the word list, returns its index in the
+ * list or -1 if the word is not in it.
  */
 static int
-cephas_word_exists(const char *word)
+cephas_word_index(const char *word)
 {
-	size_t		idx;
+	int		idx;
 
 	PRECOND(word != NULL);
 
 	for (idx = 0; idx < CEPHAS_WORD_COUNT; idx++) {
 		if (!strcmp(word, cephas_words[idx]))
-			return (0);
+			return (idx);
 	}
 
 	return (-1);
+}
+
+/*
+ * Decode the route from its words and check it against its checksum,
+ * see covenant src/remote.c. The route carries:
+ *
+ *	flock (7) || remote (4) || remote kek (1) || our kek (1) ||
+ *	cathedral (4) || port (2) || checksum (2)
+ *
+ * Everything is big endian and the flock comes without its domain. The
+ * words are a number in base CEPHAS_WORD_COUNT, most significant first.
+ * The checksum is the first two bytes of:
+ *
+ *	SHA3-256(CEPHAS_ROUTE_LABEL || route[0..19) || passphrase)
+ */
+static void
+cephas_route(const u_int16_t *words, size_t count, const char *pass)
+{
+	struct stat		st;
+	struct nyfe_sha3	ctx;
+	size_t			idx;
+	u_int16_t		port;
+	u_int64_t		flock;
+	u_int32_t		val, ip;
+	int			len, word;
+	u_int8_t		route[CEPHAS_ROUTE_LEN], digest[32];
+
+	PRECOND(words != NULL);
+	PRECOND(count == CEPHAS_ROUTE_WORDS);
+	PRECOND(pass != NULL);
+
+	memset(route, 0, sizeof(route));
+
+	for (word = 0; word < CEPHAS_ROUTE_WORDS; word++) {
+		val = words[word];
+		for (idx = sizeof(route); idx > 0; idx--) {
+			val += route[idx - 1] * CEPHAS_WORD_COUNT;
+			route[idx - 1] = val & 0xff;
+			val >>= 8;
+		}
+
+		if (val != 0)
+			fatal("the words are not right, please check them");
+	}
+
+	nyfe_zeroize_register(&ctx, sizeof(ctx));
+
+	nyfe_sha3_init256(&ctx);
+	nyfe_sha3_update(&ctx, CEPHAS_ROUTE_LABEL,
+	    sizeof(CEPHAS_ROUTE_LABEL) - 1);
+	nyfe_sha3_update(&ctx, route, 19);
+	nyfe_sha3_update(&ctx, pass, strlen(pass));
+	nyfe_sha3_final(&ctx, digest, sizeof(digest));
+
+	nyfe_zeroize(&ctx, sizeof(ctx));
+
+	if (route[19] != digest[0])
+		fatal("the words are not right, please check them");
+
+	if (route[20] != digest[1])
+		fatal("the words are not right, please check them");
+
+	flock = 0;
+	memcpy(&flock, &route[0], 7);
+	state.cfg.flock_src = be64toh(flock);
+
+	memcpy(&val, &route[7], sizeof(val));
+	state.remote = be32toh(val);
+
+	state.cfg.tunnel = (route[12] << 8) | route[11];
+
+	memcpy(&ip, &route[13], sizeof(ip));
+	memcpy(&port, &route[17], sizeof(port));
+
+	state.cathedral.sin_family = AF_INET;
+	state.cathedral.sin_port = port;
+	state.cathedral.sin_addr.s_addr = ip;
+
+	memcpy(&state.peer, &state.cathedral, sizeof(state.cathedral));
+
+	if (state.remote == 0)
+		fatal("the words carry no remote cs id");
+
+	if (route[11] == 0)
+		fatal("the words carry no remote kek id");
+
+	if (route[12] == 0)
+		fatal("the words carry no kek id for us");
+
+	if (ip == 0)
+		fatal("the words carry no cathedral address");
+
+	if (port == 0)
+		fatal("the words carry no cathedral port");
+
+	len = snprintf(state.kekpath, sizeof(state.kekpath), "%s/kek-0x%02x",
+	    state.path, route[12]);
+	if (len == -1 || (size_t)len >= sizeof(state.kekpath))
+		fatal("failed to construct kek path");
+
+	if (lstat(state.kekpath, &st) != -1)
+		fatal("%s exists", state.kekpath);
+
+	state.path = state.kekpath;
+
+	printf("flock %016" PRIx64 ", tunnel %04x with %08x via %s:%u\n",
+	    state.cfg.flock_src, state.cfg.tunnel, state.remote,
+	    inet_ntoa(state.cathedral.sin_addr), ntohs(port));
 }
 
 /*
@@ -1087,8 +1349,15 @@ cephas_parse_mode(const char *modestr, const char *path)
 		(void)close(fd);
 		break;
 	case CEPHAS_MODE_RECEIVING:
-		if (lstat(path, &st) != -1)
-			fatal("%s exists", path);
+		if (state.covenant) {
+			if (lstat(path, &st) == -1)
+				fatal("stat(%s): %s", path, errno_s);
+			if (!S_ISDIR(st.st_mode))
+				fatal("'%s' is not a directory", path);
+		} else {
+			if (lstat(path, &st) != -1)
+				fatal("%s exists", path);
+		}
 		state.path = path;
 		break;
 	default:
